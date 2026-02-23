@@ -1,18 +1,17 @@
 package me.minseok.simplecleaner;
 
 import org.bukkit.Bukkit;
-import org.bukkit.ChatColor;
 import org.bukkit.World;
 import org.bukkit.command.Command;
-
-import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
-import org.bukkit.entity.Entity;
 import org.bukkit.entity.Item;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 
 import java.io.File;
 import java.io.InputStream;
@@ -114,68 +113,119 @@ public class SimpleCleaner extends JavaPlugin {
     }
 
     private void cleanItems() {
-        int count = 0;
         List<String> whitelist = getConfig().getStringList("whitelist");
 
-        for (World world : Bukkit.getWorlds()) {
-            List<Entity> entities = world.getEntities();
-            for (Entity entity : entities) {
-                if (entity instanceof Item) {
-                    Item item = (Item) entity;
-                    String typeName = item.getItemStack().getType().name();
+        // 최적화 방안 2: 화이트리스트 검사 전처리 (루프 내 불필요한 연산 제거)
+        java.util.Set<String> exactMatches = new java.util.HashSet<>();
+        java.util.List<String> startsWithMatches = new java.util.ArrayList<>();
+        java.util.List<String> endsWithMatches = new java.util.ArrayList<>();
 
-                    // Check whitelist
-                    boolean isWhitelisted = false;
-                    for (String whiteItem : whitelist) {
-                        if (typeName.equals(whiteItem)) {
+        for (String whiteItem : whitelist) {
+            if (whiteItem.endsWith("*")) {
+                startsWithMatches.add(whiteItem.substring(0, whiteItem.length() - 1));
+            } else if (whiteItem.startsWith("*")) {
+                endsWithMatches.add(whiteItem.substring(1));
+            } else {
+                exactMatches.add(whiteItem);
+            }
+        }
+
+        // 스케줄러를 통한 삭제 대기열 수집 (메인 스레드)
+        final java.util.List<Item> targetItems = new java.util.ArrayList<>();
+
+        for (World world : Bukkit.getWorlds()) {
+            for (Item item : world.getEntitiesByClass(Item.class)) {
+                String typeName = item.getItemStack().getType().name();
+
+                boolean isWhitelisted = exactMatches.contains(typeName);
+
+                if (!isWhitelisted) {
+                    for (String prefix : startsWithMatches) {
+                        if (typeName.startsWith(prefix)) {
                             isWhitelisted = true;
                             break;
                         }
+                    }
+                }
 
-                        if (whiteItem.endsWith("*")) {
-                            String prefix = whiteItem.substring(0, whiteItem.length() - 1);
-                            if (typeName.startsWith(prefix)) {
-                                isWhitelisted = true;
-                                break;
-                            }
-                        }
-
-                        if (whiteItem.startsWith("*")) {
-                            String suffix = whiteItem.substring(1);
-                            if (typeName.endsWith(suffix)) {
-                                isWhitelisted = true;
-                                break;
-                            }
+                if (!isWhitelisted) {
+                    for (String suffix : endsWithMatches) {
+                        if (typeName.endsWith(suffix)) {
+                            isWhitelisted = true;
+                            break;
                         }
                     }
+                }
 
-                    if (isWhitelisted) {
-                        continue;
-                    }
-
-                    entity.remove();
-                    count++;
+                if (!isWhitelisted) {
+                    targetItems.add(item);
                 }
             }
         }
-        if (count > 0) {
-            String msg = getMessage("clean-complete").replace("%count%", String.valueOf(count));
-            broadcast(msg);
-        }
+
+        int totalCount = targetItems.size();
+        if (totalCount == 0)
+            return;
+
+        // 최적화 방안 3: PaperMC 틱당 아이템 분할 삭제 로직 (Lag spike 방지)
+        int itemsPerTick = getConfig().getInt("items-per-tick", 50); // 기본값 50개씩
+
+        new BukkitRunnable() {
+            int currentIndex = 0;
+
+            @Override
+            public void run() {
+                int limit = Math.min(currentIndex + itemsPerTick, totalCount);
+
+                for (int i = currentIndex; i < limit; i++) {
+                    Item item = targetItems.get(i);
+                    // 삭제 과정에서 객체가 유효한지 재확인
+                    if (item.isValid() && !item.isDead()) {
+                        item.remove();
+                    }
+                }
+
+                currentIndex = limit;
+
+                // 모든 작업이 끝났을 때
+                if (currentIndex >= totalCount) {
+                    String rawMsg = getRawMessage("clean-complete").replace("%count%", String.valueOf(totalCount));
+                    broadcast(parseMessage(rawMsg));
+                    this.cancel();
+                }
+            }
+        }.runTaskTimer(this, 1L, 1L); // 1틱마다 실행
     }
 
-    private void broadcast(String message) {
-        @SuppressWarnings("deprecation")
-        var ignore = Bukkit.broadcastMessage(message);
+    /**
+     * Adventure Component를 서버 전체에 방송합니다.
+     */
+    private void broadcast(Component message) {
+        Bukkit.broadcast(message);
     }
 
-    private String getMessage(String key) {
+    /**
+     * 메시지 키로부터 Component를 생성합니다.
+     */
+    private Component getMessage(String key) {
+        return parseMessage(getRawMessage(key));
+    }
+
+    /**
+     * 메시지 키로부터 접두사가 포함된 원본 문자열을 반환합니다.
+     */
+    private String getRawMessage(String key) {
         String prefix = getConfig().getString("prefix", "&8[&bSimpleCleaner&8] ");
         String msg = messagesConfig.getString(key);
         if (msg == null)
             return "";
-        @SuppressWarnings("deprecation")
-        String colored = ChatColor.translateAlternateColorCodes('&', prefix + msg);
-        return colored;
+        return prefix + msg;
+    }
+
+    /**
+     * 레거시 색상 코드(&)를 Adventure Component로 변환합니다.
+     */
+    private Component parseMessage(String message) {
+        return LegacyComponentSerializer.legacyAmpersand().deserialize(message);
     }
 }
